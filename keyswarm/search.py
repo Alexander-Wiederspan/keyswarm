@@ -15,6 +15,11 @@ from .pass_file_system import PassFile
 from .ui_filesystem_tree import PassUiFileSystemTree
 
 
+logging.getLogger(__name__).setLevel(logging.INFO)
+def enable_search_debug_logging():
+    """ enable debug logging for the search module """
+    logging.getLogger(__name__).setLevel(logging.DEBUG)
+
 class PasswordSearch:
     """
     Provides metadata search over a PassUiFileSystemTree.
@@ -32,7 +37,11 @@ class PasswordSearch:
         self.__tree = file_system_tree
         self.__storage = None
         self.__index = None
+        self.__fields = ['name', 'path', 'comments']
         self.__create_search_index(file_system_tree)
+
+    def __repr__(self):
+        return f'PasswordSearch(doc_count={self.__index.doc_count()})'
 
     @staticmethod
     def __create_schema():
@@ -51,12 +60,17 @@ class PasswordSearch:
         schema = PasswordSearch.__create_schema()
         self.__index = self.__storage.create_index(schema)
 
-        writer = self.__index.writer()
+        attributes = set()
+        documents = []
         node = file_system_tree.topLevelItem(0)
+        if not node:
+            logger.debug('PasswordSearch.__create_search_index:empty tree')
+            return
         child_index = 0
         child_count = node.childCount()
         stack = []
         logger.debug('create_search_index: start of iteration')
+        writer = self.__index.writer()
         while True:
             logger.debug('create_search_index: %r %r (%r/%r)',
                          list(map(lambda a: (a[0].name, a[1], a[2]), stack)),
@@ -87,11 +101,34 @@ class PasswordSearch:
                         if not isinstance(pass_file, PassFile):
                             raise ValueError('file in tree is not a PassFile')
                         path = '/'.join(list(map(lambda a: a[0].name, stack)))
-                        writer.add_document(name=pass_file.name,
-                                            path=path,
-                                            comments=pass_file.comments)
+                        document = {
+                            'name': pass_file.name,
+                            'path': path,
+                            'comments': pass_file.comments
+                            }
+                        logger.debug('__create_search_index: file_attributes: %r', pass_file.attributes)
+                        for attribute in pass_file.attributes:
+                            try:
+                                key, value = attribute
+                                logger.debug('__create_search_index: (key, value): (%r, %r)', key, value)
+                                if (key not in ['name', 'path', 'comments']
+                                    and ' ' not in key and '_' not in key):
+                                    attributes.add(key)
+                                    document[key] = value
+                            except ValueError as error:
+                                logger.debug('__create_search_index: unpack_error: %r', error)
+                        documents.append(document)
                     except ValueError as error:
                         logger.debug('create_search_index: %r', error)
+        logger.debug('__create_search_index: attributes: %r', attributes)
+        self.__fields.extend(attributes)
+        writer = self.__index.writer()
+        for attribute in attributes:
+            logger.debug('__create_search_index: adding field for attribute %r', attribute)
+            writer.add_field(attribute, TEXT)
+        for document in documents:
+            logger.debug('__create_search_index: adding document %r', document)
+            writer.add_document(**document)
         writer.commit()
         with self.__index.searcher() as searcher:
             logger.debug('create_search_index: %r', list(searcher.all_stored_fields()))
@@ -142,6 +179,7 @@ class PasswordSearch:
         :param return: [dict]
         """
         logger = logging.getLogger(__name__)
+        logger.debug('search: self: %r', self)
         logger.debug('search: raw_query: %r %r %r %r', raw_query, glob_prefix, glob_suffix, fuzzy)
         if (glob_prefix or glob_suffix) and fuzzy:
             logger.warning('search: auto-glob and auto-fuzzy are mutually exclusive')
@@ -150,7 +188,7 @@ class PasswordSearch:
         with self.__index.searcher() as searcher:
             # pylint: disable=no-member
             logger.debug('search: %r', list(searcher.all_stored_fields()))
-            parser = MultifieldParser(['name', 'path', 'comments'], self.__index.schema)
+            parser = MultifieldParser(self.__fields, self.__index.schema)
             parser.add_plugin(FuzzyTermPlugin())
             parser.add_plugin(PhrasePlugin())
             query = parser.parse(raw_query)
